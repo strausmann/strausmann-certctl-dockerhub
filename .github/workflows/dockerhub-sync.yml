@@ -1,0 +1,130 @@
+name: DockerHub Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve latest stable upstream tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tags="$(git ls-remote --refs --tags https://github.com/certctl-io/certctl.git \
+            | awk '{print $2}' \
+            | sed 's#refs/tags/##')"
+
+          latest_tag="$(printf '%s\n' "$tags" \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [[ -z "$latest_tag" ]]; then
+            echo "No stable semantic version tag found in upstream repository." >&2
+            exit 1
+          fi
+
+          full_version="${latest_tag#v}"
+          major="${full_version%%.*}"
+          minor="$(awk -F. '{print $1"."$2}' <<< "$full_version")"
+
+          {
+            echo "latest_tag=$latest_tag"
+            echo "full_version=$full_version"
+            echo "major=$major"
+            echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Using upstream tag: $latest_tag"
+
+      - name: Check whether image tags already exist on DockerHub
+        id: dockerhub
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.full_version }}
+        run: |
+          set -euo pipefail
+
+          tag_exists() {
+            local image="$1"
+            local tag="$2"
+            curl -fsS "https://registry.hub.docker.com/v2/repositories/${image}/tags/${tag}" >/dev/null
+          }
+
+          server_image="strausmann/certctl-server"
+          agent_image="strausmann/certctl-agent"
+
+          build_server=true
+          build_agent=true
+
+          if tag_exists "$server_image" "$VERSION"; then
+            echo "${server_image}:${VERSION} already exists. Skipping server build."
+            build_server=false
+          fi
+
+          if tag_exists "$agent_image" "$VERSION"; then
+            echo "${agent_image}:${VERSION} already exists. Skipping agent build."
+            build_agent=false
+          fi
+
+          {
+            echo "build_server=$build_server"
+            echo "build_agent=$build_agent"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$build_server" == "false" && "$build_agent" == "false" ]]; then
+            echo "Both target image versions already exist. Nothing to build."
+          fi
+
+      - name: Checkout upstream source at release tag
+        if: steps.dockerhub.outputs.build_server == 'true' || steps.dockerhub.outputs.build_agent == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: certctl-io/certctl
+          ref: refs/tags/${{ steps.version.outputs.latest_tag }}
+          path: upstream-certctl
+
+      - name: Set up Docker Buildx
+        if: steps.dockerhub.outputs.build_server == 'true' || steps.dockerhub.outputs.build_agent == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        if: steps.dockerhub.outputs.build_server == 'true' || steps.dockerhub.outputs.build_agent == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push certctl server image
+        if: steps.dockerhub.outputs.build_server == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream-certctl
+          file: ./upstream-certctl/Dockerfile
+          push: true
+          tags: |
+            strausmann/certctl-server:latest
+            strausmann/certctl-server:${{ steps.version.outputs.major }}
+            strausmann/certctl-server:${{ steps.version.outputs.minor }}
+            strausmann/certctl-server:${{ steps.version.outputs.full_version }}
+
+      - name: Build and push certctl agent image
+        if: steps.dockerhub.outputs.build_agent == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream-certctl
+          file: ./upstream-certctl/Dockerfile.agent
+          push: true
+          tags: |
+            strausmann/certctl-agent:latest
+            strausmann/certctl-agent:${{ steps.version.outputs.major }}
+            strausmann/certctl-agent:${{ steps.version.outputs.minor }}
+            strausmann/certctl-agent:${{ steps.version.outputs.full_version }}
